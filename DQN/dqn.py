@@ -4,6 +4,7 @@ import gym
 import time
 import ipdb
 import torch
+import wandb
 import numpy as np
 import pandas as pd
 import torch as th
@@ -13,6 +14,7 @@ import matplotlib.pyplot as plt
 from DQN.policy import DQNPolicy
 from PPO.policy import ActorCriticPolicy
 from PPO.ppo import PPO
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 # from stable_baselines3.common.buffers import ReplayBuffer
 from tools.buffers import ReplayBuffer, RolloutBuffer
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
@@ -87,14 +89,14 @@ class DQN():
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 1e-4,
         buffer_size: int = 1_000_000,  # 1e6
-        learning_starts: int = 50000,
+        learning_starts: int = 3000,
         batch_size: int = 32,
         selected_num: int = 10,
         strategy: str="concat",
         tau: float = 0.005,
         gamma: float = 0.99,
-        train_freq: Union[int, Tuple[int, str]] = 15,
-        gradient_steps: int = 1,
+        train_freq: Union[int, Tuple[int, str]] = 32,
+        gradient_steps: int = 5,
         # replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
         replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
@@ -113,6 +115,7 @@ class DQN():
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
     ):
+        self.model_kwargs = model_kwargs
         self.buffer_size = model_kwargs['buffer_size'] if model_kwargs['buffer_size'] is not None else buffer_size  
         self.observation_space = env.observation_space
         self.action_space = env.action_space
@@ -124,7 +127,7 @@ class DQN():
         self._n_calls = 0
         self.num_timesteps = 0
         self._episode_num = 0
-        self._n_updates = 0
+        self.dqn_n_updates = 0
         self.gamma = gamma
         self.selected_num = int(selected_num)
         self.strategy = str(strategy)
@@ -133,7 +136,7 @@ class DQN():
         self.gradient_steps = gradient_steps
         self.batch_size = batch_size
         # "epsilon" for the epsilon-greedy exploration
-        self.exploration_rate = 0.0
+        self.exploration_rate = 0.2
         # Linear schedule will be defined in `_setup_model()`
         self.exploration_schedule = None
         self.action_noise = None
@@ -147,8 +150,9 @@ class DQN():
         self.Reward_total = []
         self.reward_episode = []
         self.train_freq = train_freq
-        self.n_steps = 15
+        self.n_steps = 2048  # for PPO
         self.q_net, self.q_net_target = None, None
+        self.scalar = None
         self.seed = seed
         self.device = get_device(device)
         self.verbose = verbose
@@ -168,7 +172,8 @@ class DQN():
         # super()._setup_model()
         # self._setup_lr_schedule()
         self.set_random_seed(self.seed)
-        self.lr_schedule = get_schedule_fn(self.learning_rate)
+        # self.lr_schedule = get_schedule_fn(self.learning_rate)
+        self.lr_schedule = get_linear_fn(self.learning_rate, self.learning_rate*0.1, 0.5)
         # Use ReplayBuffer 
         # self.replay_buffer_class = ReplayBuffer
         self.replay_buffer = ReplayBuffer(
@@ -210,6 +215,7 @@ class DQN():
         )
 
         self.PPO = PPO(
+            policy = self.ppo_policy,
             env = self.env
         )
         
@@ -221,6 +227,8 @@ class DQN():
 
         self.q_net = self.dqn_policy.q_net
         self.q_net_target = self.dqn_policy.q_net_target
+        self.minmax_scaler = MinMaxScaler()
+        # self.scalar = StandardScaler()
         # self._create_aliases()
         # Copy running stats, see GH issue #996
         self.batch_norm_stats = get_parameters_by_name(self.q_net, ["running_"])
@@ -230,6 +238,10 @@ class DQN():
             self.exploration_final_eps,
             self.exploration_fraction,
         )
+
+        # wandb.init(config=self.model_kwargs,
+        #        project="HRL-idxtrack",
+            #    name="indtrack:test1")
         # Account for multiple environments
         # each call to step() corresponds to n_envs transitions
         if self.n_envs > 1:
@@ -264,10 +276,15 @@ class DQN():
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
         # Switch to train mode (this affects batch norm / dropout)
         self.dqn_policy.set_training_mode(True)
+        # self.ppo_policy.set_training_mode(True)
         # Update learning rate according to schedule
         # self._update_learning_rate(self.dqn_policy.optimizer)
         update_learning_rate(self.dqn_policy.optimizer, self.lr_schedule(self._current_progress_remaining))
-
+       
+        # wandb.log(
+        #     {"dqn learn rate": self.dqn_policy.optimizer.param_groups[0]['lr']},
+        #     #  step=self.dqn_n_updates
+        #     ) 
         losses = []
         for _ in range(gradient_steps):
             # Sample replay buffer
@@ -308,9 +325,14 @@ class DQN():
             self.dqn_policy.optimizer.step()
 
         # Increase update counter
-        self._n_updates += gradient_steps
+        self.dqn_n_updates += gradient_steps
 
-        self._logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        # wandb.log(
+        #     {"dqn_value_loss": np.mean(losses)},
+        #     # step=self.dqn_n_updates
+        #     ) 
+
+        self._logger.record("train/n_updates", self.dqn_n_updates, exclude="tensorboard")
         self._logger.record("train/loss", np.mean(losses))
 
     def learn(
@@ -329,29 +351,25 @@ class DQN():
         total_timesteps = self._setup_learn(total_timesteps, reset_num_timesteps, tb_log_name, progress_bar)
         times = time.localtime()
         while self.num_timesteps < total_timesteps:
-            rollout = self.collect_rollouts(
-                self.env,
-                train_freq=self.train_freq,
-                action_noise=self.action_noise,
-                # callback=callback,
-                learning_starts=self.learning_starts,
-                replay_buffer=self.replay_buffer,
-                rollout_buffer=self.rollout_buffer,
-                log_interval=log_interval,
-            )
+
+            rollout = self.collect_rollouts(self.env, action_noise=self.action_noise, learning_starts=self.learning_starts, replay_buffer=self.replay_buffer, rollout_buffer=self.rollout_buffer, log_interval=log_interval)
 
             if rollout.continue_training is False:
                 break
-
-            self.PPO.train(self.rollout_buffer, self._current_progress_remaining)
+            
             if self.num_timesteps > 0 and self.num_timesteps > self.learning_starts:
                 # If no `gradient_steps` is specified,
                 # do as many gradients steps as steps performed during the rollout
                 gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
                 # Special case when the user passes `gradient_steps=0`
-                if gradient_steps > 0:
+                if gradient_steps > 0 and self.num_timesteps % self.train_freq == 0:
+                    print('Current timesteps:',self.num_timesteps,'training DQN network')
                     self.train(batch_size=self.batch_size, gradient_steps=gradient_steps)
-
+            
+            if self.num_timesteps > 0 and self.num_timesteps % self.n_steps == 0:
+                print('Current timesteps:',self.num_timesteps,'training PPO network')
+                self.PPO.train(self.rollout_buffer, self._current_progress_remaining)
+                self.rollout_buffer.reset()
         # Plot the episode reward
         plt.plot(range(len(self.Reward_total)), self.Reward_total, "r")
         pd_reward_total = pd.DataFrame(data=self.Reward_total)
@@ -426,7 +444,7 @@ class DQN():
         # callback: BaseCallback,
         replay_buffer: ReplayBuffer,
         rollout_buffer: RolloutBuffer,
-        train_freq: int =5,
+        n_steps: int =32,
         action_noise: Optional[ActionNoise] = None,
         learning_starts: int = 0,
         log_interval: Optional[int] = None,
@@ -450,9 +468,11 @@ class DQN():
         :return:
         """
         # Switch to eval mode (this affects batch norm / dropout)
+        # if self._n_updates in [118,690,695,1190,1195,1870,1875,2380,2385]:
+        #         ipdb.set_trace()
         self.dqn_policy.set_training_mode(False)
+        self.ppo_policy.set_training_mode(False)
         # self.dqn_policy.train(False)
-
         num_collected_steps, num_collected_episodes = 0, 0
 
         assert isinstance(env, VecEnv), "You must pass a VecEnv"
@@ -464,7 +484,9 @@ class DQN():
         # Vectorize action noise if needed
         # if action_noise is not None and env.num_envs > 1 and not isinstance(action_noise, VectorizedActionNoise):
         #     action_noise = VectorizedActionNoise(action_noise, env.num_envs)
-        rollout_buffer.reset()
+
+        # rollout_buffer.reset()
+
         # if self.use_sde:
         #     self.actor.reset_noise(env.num_envs)
 
@@ -472,25 +494,32 @@ class DQN():
         continue_training = True
 
         # while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
-        while num_collected_steps < train_freq:
+        while num_collected_steps < n_steps:
             # if self.use_sde and self.sde_sample_freq > 0 and num_collected_steps % self.sde_sample_freq == 0:
                 # Sample a new noise matrix
                 # self.actor.reset_noise(env.num_envs)
-            self.dqn_policy.set_training_mode(False)
-            self.ppo_policy.set_training_mode(False)
+            # self.dqn_policy.set_training_mode(False)
+            # self.ppo_policy.set_training_mode(False)
             
             # actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs)
             # high_action, _ = self.predict(self._last_obs) # self._last_obs shape [1, T, N]
             # high_action, _ = self.dqn_policy.predict(self._last_obs) # self._last_obs shape [1, T, N]
             with th.no_grad():
+                # obs_shape = self._last_obs.shape
+                # flatten_obs = self._last_obs.reshape(-1, obs_shape[-1])
+                # norm_obs = self.scalar.fit_transform(flatten_obs)
+                # obs_tensor = obs_as_tensor(norm_obs.reshape(obs_shape), self.device)
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 high_action = self.dqn_policy(obs_tensor)
+                # if self.num_timesteps % 2048 ==0: ipdb.set_trace()
                 low_action, values, log_probs = self.ppo_policy(obs_tensor[:,:,high_action[0]+1])
             high_action = high_action.cpu().numpy()
             low_action = low_action.cpu().numpy()
-            clipped_low_action = np.clip(low_action, self.action_space[1].low, self.action_space[1].high)
+            scaled_low_action = self.minmax_scaler.fit_transform(low_action.reshape(-1,1))
+            clipped_low_action = np.clip(scaled_low_action.reshape(1,-1), self.action_space[1].low, self.action_space[1].high)
             actions = np.zeros((1, self.action_space[0].n))
             for k, v in enumerate(high_action[0]): actions[0][v] = clipped_low_action[0][k]
+            if self.num_timesteps % 400 == 0: print(high_action, actions)
             # with th.no_grad():
             #     high_action = self.dqn_policy(self._last_obs)
             #     high_action = high_action.cpu().numpy()
@@ -503,7 +532,8 @@ class DQN():
             #     actions = np.array(act)
 
             # Rescale and perform action
-            new_obs, rewards, dones, infos = env.step(high_action+1)
+            # new_obs, rewards, dones, infos = env.step(high_action+1)
+            new_obs, rewards, dones, infos = env.step(actions)
 
             if dones:
                 self.Reward_total.append(sum(self.reward_episode))
@@ -512,6 +542,7 @@ class DQN():
                 self.reward_episode.append(rewards)
 
             self.num_timesteps += env.num_envs
+            self.PPO.num_timesteps += env.num_envs
             num_collected_steps += 1
 
             # Give access to local variables
@@ -525,7 +556,27 @@ class DQN():
 
             # Store data in replay buffer (normalized action and unnormalized observation)
             # self._store_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, infos)
-            replay_buffer.add(self._last_obs, new_obs, high_action, rewards, dones, infos)
+            
+            # first observation of the next episode
+            for i, done in enumerate(dones):
+                # for DQN
+                next_obs = deepcopy(new_obs)
+                if done and infos[i].get("terminal_observation") is not None:
+                    next_obs[i] = infos[i]["terminal_observation"]
+            replay_buffer.add(self._last_obs, next_obs, high_action, rewards, dones, infos)
+            
+            # for i, done in enumerate(dones):        
+            #     # for PPO
+            #     if (
+            #         done
+            #         and infos[i].get("terminal_observation") is not None
+            #         and infos[i].get("TimeLimit.truncated", False)
+            #     ):
+            #         terminal_obs = self.ppo_policy.obs_to_tensor(infos[i]["terminal_observation"][:,high_action[0]+1])[0]
+            #         with th.no_grad():
+            #             terminal_value = self.ppo_policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
+            #         rewards[i] += self.gamma * terminal_value
+            # replay_buffer.add(self._last_obs, next_obs, high_action, rewards, dones, infos)
             rollout_buffer.add(self._last_obs[:,:,high_action[0]+1], low_action, rewards, self._last_episode_starts, values, log_probs)
             self._last_obs = new_obs
             self._last_episode_starts = dones
@@ -555,16 +606,22 @@ class DQN():
 
         with th.no_grad():
             # Compute value for the last timestep
+            # new_obs_shape = new_obs.shape
+            # flatten_obs = new_obs.reshape(-1, new_obs_shape[-1])
+            # norm_obs = self.scalar.fit_transform(flatten_obs)
+            # new_obs_tensor = obs_as_tensor(norm_obs.reshape(new_obs_shape), self.device)
             new_obs_tensor = obs_as_tensor(new_obs, self.device)
             high_action = self.dqn_policy(new_obs_tensor)
             values = self.ppo_policy.predict_values(new_obs_tensor[:,:,high_action[0]+1])
-
+            # values = torch.tensor([[0.8]])
+            # print('estimated values',values)
+            # ipdb.set_trace()
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)
 
 
-    def _sample_action(
+    def sample_action(
         self,
         learning_starts: int,
         action_noise: Optional[ActionNoise] = None,
@@ -758,7 +815,11 @@ class DQN():
         return state_dicts, []
 
     def save(self, path: str='./trained_models/SP500/') -> None:
-        torch.save(self.dqn_policy.q_net.state_dict(), path + f"policy.pth")
+        # save the dqn trained model
+        torch.save(self.dqn_policy.q_net.state_dict(), path + f"dqn_policy.pth")
+
+        # save the ppo trained model
+        torch.save(self.ppo_policy.state_dict(), path + f"ppo_policy.pth")
 
     def load(self, path: str='./trained_models/SP500/') -> None: 
         self.dqn_policy.load_state_dict(torch.load(path + f"policy.pth"))

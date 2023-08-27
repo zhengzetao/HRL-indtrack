@@ -4,6 +4,7 @@ from gym.utils import seeding
 import gym
 import ipdb
 import heapq
+import wandb
 import math as mh
 from gym import spaces
 import matplotlib
@@ -108,7 +109,7 @@ class StockPortfolioEnv(gym.Env):
         
         # self.action_space = spaces.Discrete(self.action_space)
         self.high_action_space = spaces.Discrete(self.action_space)
-        self.low_action_space = spaces.Box(low=0, high=1, shape=(self.selected_num,))
+        self.low_action_space = spaces.Box(low=0.05, high=0.3, shape=(self.selected_num,))
         self.action_space = gym.spaces.Tuple((self.high_action_space, self.low_action_space))
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.lookback, self.stock_dim))
 
@@ -154,6 +155,7 @@ class StockPortfolioEnv(gym.Env):
             # print("tracking error:{}".format(self.tracking_error[:10]))
             print("tracking_error:{}".format(np.linalg.norm(self.tracking_error)/len(self.tracking_error)))
             print("reward:{}".format(self.reward))
+            # wandb.log({"tracking error": np.linalg.norm(self.tracking_error)/len(self.tracking_error)})
 
             df_daily_return = pd.DataFrame(self.portfolio_return_memory)
             df_daily_return.columns = ["daily_return"]
@@ -169,20 +171,20 @@ class StockPortfolioEnv(gym.Env):
             return self.state, self.reward, self.terminal, {}
 
         else:
-            # weights = self.softmax_normalization(actions)
+            weights = self.softmax_normalization(actions)
 
             last_day_memory = self.data
 
-            qp_input = pd.DataFrame(self.state[:,actions])
-            index_value = pd.DataFrame(self.index_value)
-            name_list = ['stock'+str(i) for i in range(len(actions))]
-            qp_input.columns = name_list
-            # qp_input['index'] = self.index_value
-            qp_input['index'] = index_value
-            qp = qp_solver(qp_input)
-            sol = qp.solve()
-            weights = np.zeros(self.stock_dim)
-            for k, v in enumerate(actions): weights[v] = sol['x'][k]
+            # qp_input = pd.DataFrame(self.state[:,actions])
+            # index_value = pd.DataFrame(self.index_value)
+            # name_list = ['stock'+str(i) for i in range(len(actions))]
+            # qp_input.columns = name_list
+            # # qp_input['index'] = self.index_value
+            # qp_input['index'] = index_value
+            # qp = qp_solver(qp_input)
+            # sol = qp.solve()
+            # weights = np.zeros(self.stock_dim)
+            # for k, v in enumerate(actions): weights[v] = sol['x'][k]
 
 
             self.actions_memory.append(actions)
@@ -194,7 +196,7 @@ class StockPortfolioEnv(gym.Env):
                 truth_indexing = self.indexing.loc[self.day].index_list
             else:
                 portfolio_return = sum(
-                    self.data['return_list'].values[0][Week_ID,1:] * weights[1:]
+                    self.data['return_list'].values[0][Week_ID,1:] * weights[:]
                 )
                 truth_indexing = self.indexing.values[Week_ID]
 
@@ -222,7 +224,7 @@ class StockPortfolioEnv(gym.Env):
             sim = len(set(self.actions_memory[-1]).intersection(set(self.actions_memory[-2]))) / \
                   len(set(self.actions_memory[-1]).union(set(self.actions_memory[-2])))
             gap = np.mean(abs(truth_indexing - portfolio_return)) * 10
-            self.reward = (1 - np.clip(gap,0,1)**(4/5))**(5/4) #- (1 - np.clip(sim,0,1)**(4/5))**(5/4)
+            self.reward = (1 - np.clip(gap,0,1)**(3/5))**(5/3) - (1 - np.clip(sim,0,1)**(3/5))**(5/3)
 
             # load next state
             self.day += 1
@@ -271,7 +273,7 @@ class StockPortfolioEnv(gym.Env):
         sim = len(set(actions).intersection(set(self.actions_memory[-1]))) / \
             len(set(actions).union(set(self.actions_memory[-1])))
         gap = np.mean(abs(truth_indexing - portfolio_return)) * 10
-        reward = (1 - np.clip(gap,0,1)**(4/5))**(5/4) - (1 - np.clip(sim,0,1)**(4/5))**(5/4)
+        reward = (1 - np.clip(gap,0,1)**(3/5))**(5/3) - (1 - np.clip(sim,0,1)**(3/5))**(5/3)
         
         return reward
 

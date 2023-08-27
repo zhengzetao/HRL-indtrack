@@ -51,8 +51,8 @@ class QNetwork(nn.Module):
         observation_space: gym.spaces.Space,
         action_space: gym.spaces.Space,
         selected_num: int = 10,
-        strategy: str = "concat",
-        features_dim: int = 64,
+        strategy: str = "inter",
+        features_dim: int = 16,
         net_arch: Optional[List[int]] = None,
         activation_fn: Type[nn.Module] = nn.ReLU,
         normalize_images: bool = True,
@@ -110,16 +110,10 @@ class QNetwork(nn.Module):
 
         if self.strategy == "inter":
             print("execute the interative strategy")
-            # self.stock_RNN = RNN(input_shape=1, hidden_dim=features_dim)
-            # self.index_RNN = RNN(input_shape=1, hidden_dim=features_dim)
-            # stock_network = create_mlp(features_dim, int(features_dim/2), net_arch, activation_fn)
-            # index_network = create_mlp(features_dim, int(features_dim/2), net_arch, activation_fn)
-            # self.stock_network = nn.Sequential(*stock_network)
-            # self.index_network = nn.Sequential(*index_network)
             num_head = 2
             num_layer = 2
             input_dim = self.observation_space.shape[0]
-            dim_feedforward = 64
+            dim_feedforward = 16
             transformer_args = {
             "num_layers": num_layer,
             "input_dim": self.observation_space.shape[0],
@@ -129,10 +123,11 @@ class QNetwork(nn.Module):
             }
             # self.encoder = TransformerEncoder(**transformer_args)
             # self.rnn = RNN(input_shape=1, hidden_dim=features_dim)
-            self.encoder = nn.TransformerEncoderLayer(d_model=input_dim,nhead=2,batch_first=True,dropout=0.5,dim_feedforward=dim_feedforward)
+            self.stock_RNN = RNN(input_shape=1, hidden_dim=features_dim)
+            self.encoder = nn.TransformerEncoderLayer(d_model=self.features_dim,nhead=2,batch_first=True,dropout=0.5,dim_feedforward=dim_feedforward)
             self.features_extractor = nn.Flatten()
-            fuse_network = create_mlp(input_dim*action_dim, action_dim, net_arch, activation_fn)
-            score_network = create_mlp(int(input_dim*1), action_dim, net_arch, activation_fn)
+            fuse_network = create_mlp(self.features_dim*(action_dim), action_dim, net_arch, activation_fn)
+            score_network = create_mlp(int(self.features_dim*1), action_dim, net_arch, activation_fn)
             self.fuse_network = nn.Sequential(*fuse_network)
             self.score_network = nn.Sequential(*score_network)
 
@@ -199,13 +194,16 @@ class QNetwork(nn.Module):
             features = stock_score * index_score
 
         if self.strategy == "inter":
-
-            # index_feat = index_feat.view(batch_size, 1, int(self.features_dim/2))
-            # stock_feat = stock_feat.view(batch_size, stock_num, int(self.features_dim/2))
-            # fuse_feat = torch.cat((index_feat,stock_feat),1)
-            # features = self.features_extractor(fuse_feat)
-            # features = self.fuse_network(features)
-
+            lookback = obs.shape[1]
+            batch_size = obs.shape[0]
+            stock_num = obs.shape[2]
+            asset_rnn_hidden = self.stock_RNN(obs.reshape(batch_size*stock_num, lookback))
+            obs = asset_rnn_hidden[:,-1,:].view(batch_size, self.features_dim, stock_num)
+            # index_rnn_hidden = self.index_RNN(index_data.reshape(batch_size, lookback))
+            # index_rnn_hidden = index_rnn_hidden[:,-1,:].view(batch_size, self.features_dim)
+            # stock_rnn_hidden = self.stock_RNN(stock_data.reshape(batch_size*stock_num, lookback))
+            # stock_rnn_hidden = stock_rnn_hidden[:,-1,:].view(batch_size*stock_num, self.features_dim)
+            
             obs = obs.permute(0, 2, 1)
             stock_tran_hidden = self.encoder(obs)
             stock_tran_hidden = stock_tran_hidden[:,1:,:]
@@ -213,7 +211,7 @@ class QNetwork(nn.Module):
             flatten_feat = self.features_extractor(stock_tran_hidden)
             stock_score = self.fuse_network(flatten_feat)
             index_score = self.score_network(index_feat)
-            features = stock_score * index_score
+            features = stock_score #* index_score
 
         if self.strategy == "two":
             obs = obs.permute(0, 2, 1)

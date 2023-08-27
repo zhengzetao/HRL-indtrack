@@ -14,6 +14,8 @@ from torch.nn import functional as F
 from multiprocessing import Manager
 import matplotlib.pyplot as plt
 from DQN.policy import DQNPolicy
+from PPO.policy import ActorCriticPolicy
+from PPO.ppo import PPO
 from MCTS.mcts import PortfolioSelector
 # from stable_baselines3.common.buffers import ReplayBuffer
 from tools.buffers import ReplayBuffer, MCTS_ReplayBuffer
@@ -111,6 +113,7 @@ class High_level_policy():
         vf_coef: float = 0.5,
         gamma: float = 0.99,
         train_freq: Union[int, Tuple[int, str]] = 20,
+        n_steps: int = 32,
         gradient_steps: int = 200,
         replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
@@ -169,6 +172,7 @@ class High_level_policy():
         self.Reward_total = []
         self.reward_episode = []
         self.train_freq = train_freq
+        self.n_steps = n_steps
         self.q_net, self.q_net_target = None, None
         self.seed = seed
         self.device = get_device(device)
@@ -191,7 +195,7 @@ class High_level_policy():
         # self._setup_lr_schedule()
         self.set_random_seed(self.seed)
         #start lr=1e-4, end at lr=1e-6 when remaining process is 0.5
-        self.lr_schedule = get_linear_fn(self.learning_rate, self.learning_rate*0.1, 1)
+        self.lr_schedule = get_linear_fn(self.learning_rate, self.learning_rate*0.1, 0.5)
         
         # Use ReplayBuffer 
         self.replay_buffer_class = MCTS_ReplayBuffer
@@ -205,6 +209,16 @@ class High_level_policy():
             # optimize_memory_usage=self.optimize_memory_usage,
             **self.replay_buffer_kwargs,
         )
+        self.rollout_buffer = RolloutBuffer(
+            self.n_steps,
+            # self.observation_space,
+            gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.observation_space.shape[0], self.selected_num)),
+            self.action_space[1],
+            self.device,
+            # gamma=self.gamma,
+            # gae_lambda=self.gae_lambda,
+            n_envs=self.n_envs,
+        )
         self.net_args = {
             "observation_space": self.observation_space,
             "action_space": self.action_space[0],
@@ -212,17 +226,20 @@ class High_level_policy():
         }
         # wandb.init(config=self.model_kwargs,
         #        project="HRL-idxtrack",
-        #        name="indtrack1:test1")
+        #        name="indtrack:test1")
 
-        # self.policy = DQNPolicy(  # DQNPolicy=MlpPolicy
-        #     self.observation_space,
-        #     self.action_space,
-        #     self.lr_schedule,
-        #     self.selected_num,
-        #     self.strategy,
-        #     **self.policy_kwargs,  # pytype:disable=not-instantiable
-        # )
-        # self.policy = self.policy.to(self.device)
+        self.ppo_policy = ActorCriticPolicy(  # pytype:disable=not-instantiable
+            self.observation_space,
+            self.action_space[1],  # low-level action space
+            self.lr_schedule,
+            self.selected_num,
+            # **self.policy_kwargs  # pytype:disable=not-instantiable
+        )
+        self.PPO = PPO(
+            policy = self.ppo_policy,
+            env = self.env
+        )
+        self.ppo_policy = self.ppo_policy.to(self.device)
 
         
         # play_worker = PortfolioSelector(config, cur_pipes, 0)
@@ -238,10 +255,21 @@ class High_level_policy():
         # self.neural_model = Neural_Net(self.action_space.n, self.lookback)
         self.neural_model = QNetwork(**self.net_args).cuda()
         # loading the weights from pre_train DQN
-        self.neural_model.load_state_dict(th.load(self.pre_trained_path + f"policy.pth"))
+        self.neural_model.load_state_dict(th.load(self.pre_trained_path + f"dqn_policy.pth"), strict=False)
+        self.ppo_policy.load_state_dict(th.load(self.pre_trained_path + f"ppo_policy.pth"), strict=False)
         # self.neural_model = self.neural_model.to(self.device)
         # self.reg_loss = th.nn.L2Loss()
-        self.optimizer = self.optimizer_class(self.neural_model.parameters(), lr=0.001, weight_decay=0.0001)
+        # for name, value in self.neural_model.named_parameters():
+        #     print(name)
+        ignore_params = list(map(id, self.neural_model.policy_net.parameters())) + list(map(id, self.neural_model.value_net.parameters()))
+        backbone_params = filter(lambda p: id(p) not in ignore_params, self.neural_model.parameters())
+        self.optimizer = self.optimizer_class([
+            {'params':backbone_params,'lr':1e-5},
+            {'params':self.neural_model.policy_net.parameters()},
+            {'params':self.neural_model.value_net.parameters()}
+        ], lr=2e-4, weight_decay=1e-4)
+
+        # self.optimizer = self.optimizer_class(self.neural_model.parameters(), lr=0.001, weight_decay=0.0001)
         # current_model, use_history = load_model(config)
         m = Manager()
         cur_pipes = m.list([self.neural_model.get_pipes() for _ in range(self.model_kwargs['max_processes'])])
@@ -340,12 +368,12 @@ class High_level_policy():
             policy_loss = -torch.mean(torch.sum(target_policy * torch.log(pred_policy),1))
             policy_losses.append(policy_loss.item())
             # 计算价值损失
-            # value_loss = F.mse_loss(pred_value, target_value)
-            # value_losses.append(value_loss.item())
+            value_loss = F.mse_loss(pred_value, target_value)
+            value_losses.append(value_loss.item())
             #计算L2正则化损失
             # reg_loss = self.reg(self.neural_model.parameters())
             # 计算总损失
-            loss = policy_loss # + self.vf_coef * value_loss 
+            loss = policy_loss + self.vf_coef * value_loss 
             # loss = policy_loss
             # print(loss)
             
@@ -372,115 +400,15 @@ class High_level_policy():
         if math.isnan(np.mean(losses)):
             ipdb.set_trace() 
         print("training loss:{}".format(np.mean(losses)))
-        # wandb.log(
-        #     {"policy_loss": np.mean(policy_losses),
-        #     "value_loss": np.mean(value_losses),
-        #     "final loss": np.mean(losses),
-        #     "learning rate": self.optimizer.param_groups[0]['lr']},
-        #     step=self.num_timesteps)
+        wandb.log(
+            {"mcts_policy_loss": np.mean(policy_losses),
+            "mcts_value_loss": np.mean(value_losses),
+            "mcts_final loss": np.mean(losses),
+            "mcts_learning rate": self.optimizer.param_groups[0]['lr']},
+            step=self.num_timesteps)
         self._logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self._logger.record("train/loss", np.mean(losses))
 
-    # def train_PPO(self,):
-    #     """
-    #     Update policy using the currently gathered rollout buffer.
-    #     """
-    #     # Switch to train mode (this affects batch norm / dropout)
-    #     self.policy.set_training_mode(True)
-    #     # Update optimizer learning rate
-    #     self._update_learning_rate(self.policy.optimizer)
-    #     # Compute current clip range
-    #     clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
-    #     # Optional: clip range for the value function
-    #     if self.clip_range_vf is not None:
-    #         clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
-
-    #     entrentropyopy_losses = []
-    #     pg_losses, value_losses = [], []
-    #     clip_fractions = []
-
-    #     continue_training = True
-    #     # train for n_epochs epochs
-    #     for epoch in range(self.n_epochs):
-    #         approx_kl_divs = []
-    #         # Do a complete pass on the rollout buffer
-    #         for rollout_data in self.rollout_buffer.get(self.batch_size):
-    #             actions = rollout_data.actions
-    #             if isinstance(self.action_space, spaces.Discrete):
-    #                 # Convert discrete action from float to long
-    #                 actions = rollout_data.actions.long().flatten()
-
-    #             # Re-sample the noise matrix because the log_std has changed
-    #             if self.use_sde:
-    #                 self.policy.reset_noise(self.batch_size)
-
-    #             values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
-    #             values = values.flatten()
-    #             # Normalize advantage
-    #             advantages = rollout_data.advantages
-    #             # Normalization does not make sense if mini batchsize == 1, see GH issue #325
-    #             if self.normalize_advantage and len(advantages) > 1:
-    #                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-    #             # ratio between old and new policy, should be one at the first iteration
-    #             ratio = th.exp(log_prob - rollout_data.old_log_prob)
-
-    #             # clipped surrogate loss
-    #             policy_loss_1 = advantages * ratio
-    #             policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-    #             policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
-
-    #             # Logging
-    #             pg_losses.append(policy_loss.item())
-    #             clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
-    #             clip_fractions.append(clip_fraction)
-
-    #             if self.clip_range_vf is None:
-    #                 # No clipping
-    #                 values_pred = values
-    #             else:
-    #                 # Clip the difference between old and new value
-    #                 # NOTE: this depends on the reward scaling
-    #                 values_pred = rollout_data.old_values + th.clamp(
-    #                     values - rollout_data.old_values, -clip_range_vf, clip_range_vf
-    #                 )
-    #             # Value loss using the TD(gae_lambda) target
-    #             value_loss = F.mse_loss(rollout_data.returns, values_pred)
-    #             value_losses.append(value_loss.item())
-
-    #             # Entropy loss favor exploration
-    #             if entropy is None:
-    #                 # Approximate entropy when no analytical form
-    #                 entropy_loss = -th.mean(-log_prob)
-    #             else:
-    #                 entropy_loss = -th.mean(entropy)
-
-    #             entropy_losses.append(entropy_loss.item())
-
-    #             loss = policy_loss + self.vf_coef * value_loss #+ self.ent_coef * entropy_loss 
-
-    #             # Calculate approximate form of reverse KL Divergence for early stopping
-    #             with th.no_grad():
-    #                 log_ratio = log_prob - rollout_data.old_log_prob
-    #                 approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-    #                 approx_kl_divs.append(approx_kl_div)
-
-    #             if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-    #                 continue_training = False
-    #                 if self.verbose >= 1:
-    #                     print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
-    #                 break
-
-    #             # Optimization step
-    #             self.policy.optimizer.zero_grad()
-    #             loss.backward()
-    #             # Clip grad norm
-    #             th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-    #             self.policy.optimizer.step()
-
-    #         self._n_updates += 1
-    #         if not continue_training:
-    #             break
 
     def predict(self, observation, num_step=10001, deterministic: bool = False):
         """
@@ -556,6 +484,10 @@ class High_level_policy():
                     # 一次episode数据训练完成，清空buffer
                     self.replay_buffer.reset()
                     print("One training session completed, buffer cleared!")
+            if self.num_timesteps > 0 and self.num_timesteps % self.n_steps == 0:
+                print('Current timesteps:',self.num_timesteps,'training PPO network')
+                self.PPO.train(self.rollout_buffer, self._current_progress_remaining)
+                self.rollout_buffer.reset()
 
         # Plot the episode reward
         plt.plot(range(len(self.Reward_total)), self.Reward_total, "r")
@@ -690,19 +622,15 @@ class High_level_policy():
             
             # 这里调用MCTS搜索出K个节点，actions是长度为K的列表, policys是长度为K的列表，每个元素里面包含N长度的分布
             # observation = deepcopy(self._last_obs)
-            actions, policys = self.policy.select_portfolio(self._last_obs, self.num_timesteps, training=True)
-            # print(actions)
+            high_action, policys = self.policy.select_portfolio(self._last_obs, self.num_timesteps, training=True)
             
             # low-level policy: react according to the low-level obs
-            # low_obs = self._last_obs[:,:,actions]
-            # with th.no_grad():
-            #     # Convert to pytorch tensor or to TensorDict
-            #     obs_tensor = obs_as_tensor(low_obs, self.device)
-                # actions, values, log_probs = self.policy(obs_tensor)
-            # actions = actions.cpu().numpy()
-            # if isinstance(self.action_space, spaces.Box):
-            #     actions = np.clip(actions, self.action_space.low, self.action_space.high)
-
+            low_action, values, log_probs = self.ppo_policy(obs_tensor[:,:,high_action[0]+1])
+            high_action = high_action.cpu().numpy()
+            low_action = low_action.cpu().numpy()
+            clipped_low_action = np.clip(low_action, self.action_space[1].low, self.action_space[1].high)
+            actions = np.zeros((1, self.action_space[0].n))
+            for k, v in enumerate(high_action[0]): actions[0][v] = clipped_low_action[0][k]
 
             # Rescale and perform action
             new_obs, rewards, dones, infos = env.step(actions)
@@ -720,18 +648,46 @@ class High_level_policy():
             # self._update_info_buffer(infos, dones)
 
             # Store high level data in replay buffer (normalized action and unnormalized observation)
-            self._store_transition(replay_buffer, actions, policys, new_obs, rewards, dones, infos)
+            # self._store_transition(replay_buffer, actions, policys, new_obs, rewards, dones, infos)
             # store low level data in low-level buffer
-            # rollout_buffer.add(
-            #     low_obs,  # type: ignore[arg-type]
-            #     actions,
-            #     rewards,
-            #     self._last_episode_starts,  # type: ignore[arg-type]
-            #     values,
-            #     log_probs,
-            # )
-            # self._last_obs = new_obs
-            # self._last_episode_starts = dones
+            for i, done in enumerate(dones):
+                if done and infos[i].get("terminal_observation") is not None:
+                    if isinstance(next_obs, dict):
+                        next_obs_ = infos[i]["terminal_observation"]
+                        # VecNormalize normalizes the terminal observation
+                        if self._vec_normalize_env is not None:
+                            next_obs_ = self._vec_normalize_env.unnormalize_obs(next_obs_)
+                        # Replace next obs for the correct envs
+                        for key in next_obs.keys():
+                            next_obs[key][i] = next_obs_[key]
+                    else:
+                        next_obs[i] = infos[i]["terminal_observation"]
+                        # VecNormalize normalizes the terminal observation
+                        if self._vec_normalize_env is not None:
+                            next_obs[i] = self._vec_normalize_env.unnormalize_obs(next_obs[i, :])
+            
+            node_state = deepcopy(self._last_obs)
+            for action, policy in zip(high_action[0], policys):
+                replay_buffer.add(
+                    node_state,
+                    policy,
+                    action,
+                    rewards,
+                    dones,
+                    infos,
+                )
+                node_state[:,:,action] = 0
+
+            rollout_buffer.add(
+                self._last_obs[:,:,high_action[0]+1], 
+                low_action, 
+                rewards, 
+                self._last_episode_starts, 
+                values, 
+                log_probs,
+            )
+            self._last_obs = new_obs
+            self._last_episode_starts = dones
 
             # with th.no_grad():
             # Compute value for the last timestep
@@ -762,6 +718,13 @@ class High_level_policy():
                     # Log training infos
                     # if log_interval is not None and self._episode_num % log_interval == 0:
                     #     self._dump_logs()
+            with th.no_grad():
+                # Compute value for the last timestep
+                new_obs_tensor = obs_as_tensor(new_obs, self.device)
+                high_action, policys = self.policy.select_portfolio(self._last_obs, self.num_timesteps, training=True)
+                values = self.ppo_policy.predict_values(new_obs_tensor[:,:,high_action[0]+1])
+                # values = self.ppo_policy.predict_values(new_obs_tensor[:,:,high_action[0]+1])
+            rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
         # callback.on_rollout_end()
         # Print statement added to indicate completion of episode data collection
@@ -889,6 +852,14 @@ class High_level_policy():
             )
             node_state[:,:,action] = 0
 
+        rollout_buffer.add(
+            self._last_obs[:,:,high_action[0]+1], 
+            low_action, 
+            rewards, 
+            self._last_episode_starts, 
+            values, 
+            log_probs,
+        )
         # replay_buffer.add(
         #     self._last_original_obs,
         #     next_obs,
@@ -1005,7 +976,7 @@ class QNetwork(nn.Module):
         action_space: gym.spaces.Space,
         selected_num: int = 10,
         strategy: str = "concat",
-        features_dim: int = 64,
+        features_dim: int = 16,
         net_arch: Optional[List[int]] = None,
         activation_fn: Type[nn.Module] = nn.ReLU,
         normalize_images: bool = True,
@@ -1049,7 +1020,7 @@ class QNetwork(nn.Module):
         num_head = 2
         num_layer = 2
         input_dim = self.observation_space.shape[0]
-        dim_feedforward = 64
+        dim_feedforward = 16
         transformer_args = {
         "num_layers": num_layer,
         "input_dim": self.observation_space.shape[0],
@@ -1058,13 +1029,17 @@ class QNetwork(nn.Module):
         "dropout": 0.5,
         }
         # self.encoder = TransformerEncoder(**transformer_args)
-        self.encoder = nn.TransformerEncoderLayer(d_model=input_dim,nhead=2,batch_first=True,dropout=0.5,dim_feedforward=dim_feedforward)
+        self.stock_RNN = RNN(input_shape=1, hidden_dim=features_dim)
+        self.encoder = nn.TransformerEncoderLayer(d_model=self.features_dim,nhead=2,batch_first=True,dropout=0.5,dim_feedforward=dim_feedforward)
         self.features_extractor = nn.Flatten()
-        fuse_network = create_mlp(input_dim*action_dim, action_dim, net_arch, activation_fn)
-        score_network = create_mlp(int(input_dim*1), action_dim, net_arch, activation_fn)
+        fuse_network = create_mlp(self.features_dim*action_dim, action_dim, net_arch, activation_fn)
+        score_network = create_mlp(int(self.features_dim*1), action_dim, net_arch, activation_fn)
         self.fuse_network = nn.Sequential(*fuse_network)
         self.score_network = nn.Sequential(*score_network)
-
+        policy_net = create_mlp(self.features_dim*action_dim, action_dim, net_arch, activation_fn)
+        value_net = create_mlp(self.features_dim*action_dim, 1, net_arch, activation_fn)
+        self.policy_net = nn.Sequential(*policy_net)
+        self.value_net = nn.Sequential(*value_net)
         # if self.strategy == "two":
         #     input_dim = self.observation_space.shape[0]
         #     print("execute the two-stream strategy")
@@ -1095,22 +1070,26 @@ class QNetwork(nn.Module):
         #     self.index_network = nn.Sequential(*index_network)
 
     def extract_features(self, obs):
-        # if self.strategy == "inter":
+        lookback = obs.shape[-2]
+        batch_size = obs.shape[0]
+        stock_num = obs.shape[-1]
+        asset_rnn_hidden = self.stock_RNN(obs.reshape(batch_size*stock_num, lookback).cuda())
+        obs = asset_rnn_hidden[:,-1,:].view(batch_size, self.features_dim, stock_num)
 
         # index_feat = index_feat.view(batch_size, 1, int(self.features_dim/2))
         # stock_feat = stock_feat.view(batch_size, stock_num, int(self.features_dim/2))
         # fuse_feat = torch.cat((index_feat,stock_feat),1)
         # features = self.features_extractor(fuse_feat)
         # features = self.fuse_network(features)
-        obs = obs.reshape(-1, self.stock_num, self.lookback).cuda()
-        # obs = obs.permute(0, 2, 1)
+        # obs = obs.reshape(-1, self.stock_num, self.lookback).cuda()
+        obs = obs.permute(0, 2, 1)
         stock_tran_hidden = self.encoder(obs)
         stock_tran_hidden = stock_tran_hidden[:,1:,:]
-        index_feat = stock_tran_hidden[:,0,:]
+        # index_feat = stock_tran_hidden[:,0,:]
         flatten_feat = self.features_extractor(stock_tran_hidden)
         stock_score = self.fuse_network(flatten_feat)
-        index_score = self.score_network(index_feat)
-        features = stock_score * index_score
+        # index_score = self.score_network(index_feat)
+        features = stock_score #* index_score
 
         # if self.strategy == "two":
         #     obs = obs.permute(0, 2, 1)
@@ -1135,7 +1114,7 @@ class QNetwork(nn.Module):
         #     index_score = self.index_network(flatten_stock_feat2)
         #     features = 0.9*stock_score + 0.1*index_score
 
-        return features
+        return flatten_feat
 
     def forward(self, obs: th.Tensor) -> th.Tensor:
         """
@@ -1148,8 +1127,11 @@ class QNetwork(nn.Module):
         #     return self.q_net(self.extract_features(obs))
         # if self.strategy == "solo" or self.strategy =="inter" or self.strategy=="two":
         q_values = self.extract_features(obs)
-        pi = th.nn.Softmax(dim=1)(q_values)
-        v = torch.zeros([q_values.shape[0],1])
+        # pi = th.nn.Softmax(dim=1)(q_values)
+        # v = torch.zeros([q_values.shape[0],1])
+        _pi = self.policy_net(q_values)
+        pi = th.nn.Softmax(dim=1)(_pi)
+        v = self.value_net(q_values)
         return pi, v
 
     def _predict(self, observation: th.Tensor, deterministic: bool = True) -> th.Tensor:

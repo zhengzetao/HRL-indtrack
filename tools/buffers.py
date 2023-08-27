@@ -5,7 +5,7 @@ from typing import Any, Dict, Generator, List, Optional, Union, NamedTuple
 import numpy as np
 import torch as th
 from gym import spaces
-
+import ipdb
 from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
 from stable_baselines3.common.type_aliases import (
     DictReplayBufferSamples,
@@ -252,21 +252,26 @@ class RolloutBuffer(BaseBuffer):
         """
         # Convert to numpy
         last_values = last_values.clone().cpu().numpy().flatten()
-
+        # ipdb.set_trace()
+        td_lambda = 0.5
         last_gae_lam = 0
         for step in reversed(range(self.buffer_size)):
             if step == self.buffer_size - 1:
                 next_non_terminal = 1.0 - dones
                 next_values = last_values
+                # next_return = 0
             else:
                 next_non_terminal = 1.0 - self.episode_starts[step + 1]
                 next_values = self.values[step + 1]
+                # next_return = self.returns[step + 1]
             delta = self.rewards[step] + self.gamma * next_values * next_non_terminal - self.values[step]
             last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
             self.advantages[step] = last_gae_lam
         # TD(lambda) estimator, see Github PR #375 or "Telescoping in TD(lambda)"
         # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
         self.returns = self.advantages + self.values
+        # self.returns[step] = td_lambda * self.gamma * next_return + \
+        #                    (self.rewards[step] + (1 - td_lambda) * self.gamma * next_values * next_non_terminal)
 
     def add(
         self,

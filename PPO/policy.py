@@ -4,7 +4,7 @@ import copy
 from abc import ABC, abstractmethod
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
-
+import random
 import gym
 import numpy as np
 import torch as th
@@ -28,6 +28,7 @@ from tools.torch_layers import (
     NatureCNN,
     create_mlp,
     RNN,
+    TemporalConvNet,
 )
 from stable_baselines3.common.type_aliases import Schedule
 from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
@@ -76,7 +77,7 @@ class ActorCriticPolicy(nn.Module):
         selected_num: int = 10,
         # agent_num: int = 4,
         net_arch: Optional[List[Union[int, Dict[str, List[int]]]]] = None,
-        activation_fn: Type[nn.Module] = nn.Tanh,
+        activation_fn: Type[nn.Module] = nn.ReLU, #Tanh
         ortho_init: bool = True,
         hidden_dim: int = 16,
         use_sde: bool = False,
@@ -118,7 +119,7 @@ class ActorCriticPolicy(nn.Module):
             if features_extractor_class == NatureCNN:
                 net_arch = []
             else:
-                net_arch = [dict(pi=[64, 64], vf=[64, 64])]
+                net_arch = [dict(pi=[32, 16], vf=[64, 64])]
 
         self.net_arch = net_arch
         self.activation_fn = activation_fn
@@ -148,7 +149,8 @@ class ActorCriticPolicy(nn.Module):
         self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
         # Buuld RNN 
         self.RNN =RNN(input_shape=1, hidden_dim=self.hidden_dim)  # only the close price as input, so the shape is 1
-
+        self.TCN = TemporalConvNet(num_inputs=1, num_channels=[self.hidden_dim])
+        self.encoder = nn.TransformerEncoderLayer(d_model=self.hidden_dim,nhead=4,batch_first=True,dropout=0.5,dim_feedforward=self.hidden_dim)
 
         self._build(lr_schedule)
 
@@ -172,6 +174,8 @@ class ActorCriticPolicy(nn.Module):
 
         self.mlp_extractor = MlpExtractor(
             feature_dim=self.actor_inpu_dim,
+            # feature_dim=self.selected_num * 10,
+            # feature_dim=self.selected_num * self.hidden_dim,
             net_arch=self.net_arch,
             activation_fn=self.activation_fn,
             device=self.device,
@@ -224,7 +228,7 @@ class ActorCriticPolicy(nn.Module):
                 module.apply(partial(self.init_weights, gain=gain))
 
         # Setup optimizer with initial learning rate
-        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), weight_decay=0.1)
 
     def forward(self, obs: th.Tensor, last_action: th.Tensor = None) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -236,10 +240,12 @@ class ActorCriticPolicy(nn.Module):
         """
         # obs = obs_as_tensor(obs,device=self.device)
         latent_pi, latent_vf, latent_sde = self._get_latent(obs.permute(0,2,1), last_action)   #   obs.shape = [1, 30, 252]
+        # if random.random()<0.1: print('latent pi value:',latent_pi,'latent shape:',latent_pi.shape)
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
         distribution, action_mean = self._get_action_dist_from_latent(latent_pi, latent_sde=latent_sde)
         actions = distribution.get_actions()
+        # if random.random()<0.1: print('action value:',actions,'action mean:',action_mean)
         log_prob = distribution.log_prob(actions)
         return actions, values, log_prob
 
@@ -259,9 +265,13 @@ class ActorCriticPolicy(nn.Module):
         batch_size = obs.shape[0]
         stock_num = obs.shape[1]
         lookback = obs.shape[2]
+        # tcn_hidden = self.TCN(obs.reshape(batch_size*stock_num, 1, lookback)) # shape: (n_stocks, fea_dim, time_step)
+        # tcn_hidden = tcn_hidden[:,:,-1].view(batch_size, stock_num, self.hidden_dim)
         rnn_hidden = self.RNN(obs.reshape(batch_size*stock_num, lookback))   # rnn_hidden shape should be (stock_dim, lookback, hidden_dim)
         rnn_hidden = rnn_hidden[:,-1,:].view(batch_size, stock_num, self.hidden_dim)
-        features = self.features_extractor(rnn_hidden)   # only use the last time step hidden state, features.shape = [1, 1920] flatten 
+        stock_tran_hidden = self.encoder(rnn_hidden)
+        features = self.features_extractor(stock_tran_hidden)   # only use the last time step hidden state, features.shape = [1, 1920] flatten 
+        # features = self.features_extractor(rnn_hidden)
         if self.use_last_action:
             features = th.cat([features, last_action.cuda()],1)   # concat the rnn_latent and last_action
         latent_pi, latent_vf = self.mlp_extractor(features)   # laten_pi.shape = [1, 64], None in second placeholder means the actor mlp extractor

@@ -111,14 +111,14 @@ def train_stock_trading(dataset, K, strategy):
     ################ DQN #########################
     model_dqn = agent.get_model("dqn", K, strategy=strategy)
     trained_dqn = agent.train_model(
-        model=model_dqn, tb_log_name="dqn", total_timesteps=50000, eval_env = e_trade_gym
+        model=model_dqn, tb_log_name="dqn", total_timesteps=1000, eval_env = e_trade_gym
     )
     model_dqn.save(TRAINED_MODEL_PATH)
 
     print("============== Heuristic-guided Search with MCTS===========")
     model_mcts = agent.get_model("mcts", K, pre_trained_path=TRAINED_MODEL_PATH)
     trained_mcts = agent.train_model(
-        model=model_mcts, tb_log_name="mcts", total_timesteps=150, eval_env = e_trade_gym
+        model=model_mcts, tb_log_name="mcts", total_timesteps=2000, eval_env = e_trade_gym
     )
 
     print("============== Start Trading WITH DQN===========")

@@ -44,7 +44,7 @@ TECHNICAL_INDICATORS_LIST = ["macd","rsi_30", "close_5_sma", "close_15_sma", "cl
 A2C_PARAMS = {"n_steps": 5, "ent_coef": 0.005, "learning_rate": 0.0002}
 DQN_PARAMS = {
     "buffer_size": 1000000, 
-    "learning_rate": 0.0002,
+    "learning_rate": 0.0001,
     "learning_starts": 3000,
 }
 PPO_PARAMS = {
@@ -65,10 +65,10 @@ SAC_PARAMS = {
 }
 MCTS_PARAMS = {
     "max_processes":1,
-    "search_threads":50,
+    "search_threads":300,
     "virtual_loss": 10,
-    "simulation_num_per_move_train": 50,
-    "simulation_num_per_move_test": 200,
+    "simulation_num_per_move_train": 300,
+    "simulation_num_per_move_test": 800,
     "c_puct": 2.5,
     "noise_eps": 0.15,
     "dirichlet_alpha": 0.2,
